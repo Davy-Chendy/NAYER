@@ -170,6 +170,7 @@ class NAYER(BaseSynthesis):
             self.generator.re_init_le()
 
             if self.dataset == "imagenet":
+                print(f'dataset: {self.dataset}')
                 targets, ys = self.generate_ys_in(cr=0.0, i=gs)
                 print(targets)
             else:
@@ -206,8 +207,9 @@ class NAYER(BaseSynthesis):
                 if loss_oh.item() < best_oh:
                     best_oh = loss_oh
 
-                print("%s - bn %s - bn %s - oh %s - adv %s" % (
-                it, (loss_bn * self.bn).data, loss_bn.data, (loss_oh).data, (self.adv * loss_adv).data))
+                if it % 10 == 0:
+                    print("%s - bn %s - bn %s - oh %s - adv %s" % (
+                    it, (loss_bn * self.bn).data, loss_bn.data, (loss_oh).data, (self.adv * loss_adv).data))
 
                 with torch.no_grad():
                     if best_cost > loss.item() or best_inputs is None:

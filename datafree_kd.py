@@ -25,24 +25,33 @@ import torchvision.transforms as transformstransforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 import wandb
+import timm
+import sys
+import os
+os.environ['TORCH_HOME'] = '/chenyaofo/cgh/cowork/cdy/research/checkpoints'
+
+sys.path.append('/chenyaofo/cgh/cowork/cdy/research/SAR_cdy/models')
+
+# 然后直接导入 Res 模块
+import Res as Resnet
 
 parser = argparse.ArgumentParser(description='Data-free Knowledge Distillation')
 
 # Data Free
-parser.add_argument('--method', default='nldf', choices=['nldf'])
+parser.add_argument('--method', default='nldf', choices=['nldf', 'nayer'])
 parser.add_argument('--adv', default=1.33, type=float, help='scaling factor for adversarial distillation')
 parser.add_argument('--bn', default=10, type=float, help='scaling factor for BN regularization')
 parser.add_argument('--oh', default=0.5, type=float, help='scaling factor for one hot loss (cross entropy)')
 parser.add_argument('--act', default=0, type=float, help='scaling factor for activation loss used in DAFL')
 parser.add_argument('--balance', default=0, type=float, help='scaling factor for class balance')
-parser.add_argument('--save_dir', default='run/', type=str)
+parser.add_argument('--save_dir', default='/chenyaofo/cgh/cowork/cdy/research/NAYER/outputs', type=str)
 parser.add_argument('--cmi_init', default=None, type=str, help='path to pre-inverted data')
 
 parser.add_argument('--bn_mmt', default=0.9, type=float,
                     help='momentum when fitting batchnorm statistics')
 
 # CDF
-parser.add_argument('--log_tag', default='ti-r34-test')
+parser.add_argument('--log_tag', default='test')
 parser.add_argument('--epochs', default=120, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--warmup', default=1, type=int, metavar='N',
@@ -63,8 +72,8 @@ parser.add_argument('--oht', default=3.0, type=float,
 
 # Basic
 parser.add_argument('--data_root', default='/datasets/')
-parser.add_argument('--teacher', default='resnet34')
-parser.add_argument('--student', default='resnet18')
+parser.add_argument('--teacher', default='resnet50bn')
+parser.add_argument('--student', default='resnet50gn')
 parser.add_argument('--dataset', default='cifar10', choices=['cifar10', 'cifar100', 'tiny_imagenet', 'imagenet'])
 parser.add_argument('--lr', default=0.2, type=float,
                     help='initial learning rate for KD')
@@ -124,7 +133,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight_decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
-parser.add_argument('-p', '--print_freq', default=0, type=int,
+parser.add_argument('-p', '--print_freq', default=40, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
@@ -135,8 +144,10 @@ time_cost = 0
 
 def main():
     args = parser.parse_args()
-
-    args.save_dir = args.save_dir + args.log_tag
+    
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    
+    args.save_dir = args.save_dir + args.log_tag + f'-{timestamp}'
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -199,11 +210,23 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################
     if args.log_tag != '':
         args.log_tag = '-' + args.log_tag
-    log_name = 'R%d-%s-%s-%s%s' % (args.rank, args.dataset, args.teacher, args.student, args.log_tag) \
-        if args.multiprocessing_distributed else '%s-%s-%s' % (args.dataset, args.teacher, args.student)
-    args.logger = datafree.utils.logger.get_logger(log_name, output='checkpoints/datafree-%s/log-%s-%s-%s%s.txt'
-                                                                    % (args.method, args.dataset, args.teacher,
-                                                                       args.student, args.log_tag))
+    # log_name = 'R%d-%s-%s-%s%s' % (args.rank, args.dataset, args.teacher, args.student, args.log_tag) \
+    #     if args.multiprocessing_distributed else '%s-%s-%s' % (args.dataset, args.teacher, args.student)
+    # args.logger = datafree.utils.logger.get_logger(log_name, output='checkpoints/datafree-%s/log-%s-%s-%s%s.txt'
+    #                                                                 % (args.method, args.dataset, args.teacher,
+    #                                                                    args.student, args.log_tag))
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    if args.multiprocessing_distributed:
+        log_name = 'R%d-%s-%s-%s%s-%s' % (args.rank, args.dataset, args.teacher, args.student, args.log_tag, timestamp)
+    else:
+        log_name = '%s-%s-%s-%s' % (args.dataset, args.teacher, args.student, timestamp)
+
+    log_file = 'checkpoints/datafree-%s/%s/log-%s-%s-%s%s-%s.txt' % (
+        args.method, args.dataset, args.dataset, args.teacher, args.student, args.log_tag, timestamp
+    )
+
+    args.logger = datafree.utils.logger.get_logger(log_name, output=log_file)
+    
     if args.rank <= 0:
         for k, v in datafree.utils.flatten_dict(vars(args)).items():  # print args
             args.logger.info("%s: %s" % (k, v))
@@ -264,13 +287,26 @@ def main_worker(gpu, ngpus_per_node, args):
     student = registry.get_model(args.student, num_classes=num_classes)
     teacher = registry.get_model(args.teacher, num_classes=num_classes, pretrained=True).eval()
     args.normalizer = datafree.utils.Normalizer(**registry.NORMALIZE_DICT[args.dataset])
-    # pretrain = torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
-    #                                    map_location='cpu')['state_dict']
+    pretrain = torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
+                                       map_location='cpu')['state_dict']
     if args.dataset != 'imagenet':
         teacher.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
                                            map_location='cpu')['state_dict'])
     student = prepare_model(student)
     teacher = prepare_model(teacher)
+    # student = timm.create_model('resnet50_gn', pretrained=True).cuda(args.gpu)
+    # student = Resnet.__dict__['resnet50'](pretrained=False).eval().cuda(args.gpu)
+    # teacher = Resnet.__dict__['resnet50'](pretrained=True).eval().cuda(args.gpu)
+    
+    # teacher = Resnet.__dict__['resnet56'](num_classes=10)
+    # teacher.load_state_dict(torch.load('resnet56_cifar10.pth'))
+    # teacher.eval().cuda(args.gpu)
+    
+    # student = Resnet.__dict__['resnet56'](num_classes=10)
+    # student.cuda(args.gpu)
+    # student.train()
+
+    
     criterion = datafree.criterions.KLDiv(T=args.T)
 
     ############################################
@@ -367,9 +403,11 @@ def main_worker(gpu, ngpus_per_node, args):
     # Evaluate
     ############################################
     if args.evaluate_only:
-        student.eval()
-        eval_results = evaluator(student, device=args.gpu)
-        print('[Eval] Acc={acc:.4f}'.format(acc=eval_results['Acc']))
+        # student.eval()
+        # eval_results = evaluator(student, device=args.gpu)
+        teacher.eval()
+        eval_results = evaluator(teacher, device=args.gpu)
+        print('[Eval] Acc={acc:.4f}'.format(acc=eval_results['Acc'][0]))
         return
 
     ############################################
@@ -417,18 +455,36 @@ def main_worker(gpu, ngpus_per_node, args):
 
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
-        _best_ckpt = 'checkpoints/datafree-%s/%s-%s-%s-%s.pth' % (args.method, args.dataset, args.teacher, args.student,
-                                                                  args.log_tag)
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                    and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.student,
-                'state_dict': student.state_dict(),
-                'best_acc1': float(best_acc1),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-            }, is_best, _best_ckpt)
+        # _best_ckpt = 'checkpoints/datafree-%s/%s-%s-%s-%s.pth' % (args.method, args.dataset, args.teacher, args.student,
+        #                                                           args.log_tag)
+        # if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+        #                                             and args.rank % ngpus_per_node == 0):
+        #     save_checkpoint({
+        #         'epoch': epoch + 1,
+        #         'arch': args.student,
+        #         'state_dict': student.state_dict(),
+        #         'best_acc1': float(best_acc1),
+        #         'optimizer': optimizer.state_dict(),
+        #         'scheduler': scheduler.state_dict(),
+        #     }, is_best, _best_ckpt)
+        
+        save_dict = {
+            'epoch': epoch + 1,
+            'state_dict': student.state_dict(),
+            'best_acc1': float(best_acc1),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+        }
+
+        # 同时保留一个 latest，方便直接 resume
+        latest_path = f'checkpoints/datafree-{args.method}/{args.dataset}/{args.dataset}-{args.teacher}2{args.student}{args.log_tag}_latest.pth'
+        torch.save(save_dict, latest_path)
+
+        # best 单独保存一份
+        if is_best:
+            best_path = f'checkpoints/datafree-{args.method}/{args.dataset}/{args.dataset}-{args.teacher}2{args.student}{args.log_tag}_best.pth'
+            torch.save(save_dict, best_path)
+            best_acc1 = acc1
 
         if epoch >= args.warmup:
             scheduler.step()
@@ -458,6 +514,7 @@ def train(synthesizer, model, criterion, optimizer, args):
         with args.autocast():
             with torch.no_grad():
                 t_out, t_feat = teacher(images, return_features=True)
+                # t_out, t_feat = teacher(images, return_feature=True)
             s_out = student(images.detach())
             loss_s = criterion(s_out, t_out.detach())
 

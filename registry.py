@@ -121,7 +121,7 @@ def get_dataset(name: str, data_root: str='data', return_transform=False, split=
             T.ToTensor(),
             T.Normalize( **NORMALIZE_DICT[name] ),
         ])
-        data_root = os.path.join( data_root, 'CIFAR10' )
+        # data_root = os.path.join( data_root, 'CIFAR10' )
         train_dst = datasets.CIFAR10(data_root, train=True, download=True, transform=train_transform)
         val_dst = datasets.CIFAR10(data_root, train=False, download=True, transform=val_transform)
     elif name=='cifar100':
@@ -136,7 +136,7 @@ def get_dataset(name: str, data_root: str='data', return_transform=False, split=
             T.ToTensor(),
             T.Normalize( **NORMALIZE_DICT[name] ),
         ])
-        data_root = os.path.join( data_root, 'CIFAR100' )
+        # data_root = os.path.join( data_root, 'CIFAR100' )
         train_dst = datasets.CIFAR100(data_root, train=True, download=True, transform=train_transform)
         val_dst = datasets.CIFAR100(data_root, train=False, download=True, transform=val_transform)
     elif name=='svhn':
@@ -166,12 +166,13 @@ def get_dataset(name: str, data_root: str='data', return_transform=False, split=
             T.ToTensor(),
             T.Normalize(**NORMALIZE_DICT[name]),
         ])
-        data_root = os.path.join(data_root, 'ImageNet')
+        # data_root = os.path.join(data_root, 'ImageNet')
+        data_root = os.path.join(data_root, 'imagenet')
         train_root = os.path.join(data_root, 'train')
         val_root = os.path.join(data_root, 'val')
         # train_dst = None
-        train_dst = datasets.ImageFolder(root=val_root, transform=train_transform)
-        val_dst = datasets.ImageFolder(root=val_root, transform=train_transform)
+        train_dst = datasets.ImageFolder(root=train_root, transform=train_transform)
+        val_dst = datasets.ImageFolder(root=val_root, transform=val_transform)
         # train_dst = datasets.ImageNet(data_root, split='train', transform=train_transform)
         # val_dst = datasets.ImageNet(data_root, split='val', transform=val_transform)
     elif name=='imagenet_32x32':

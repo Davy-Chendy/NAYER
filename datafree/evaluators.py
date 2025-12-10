@@ -15,6 +15,24 @@ class Evaluator(object):
                 inputs, targets = inputs.cuda(), targets.cuda()
                 outputs = model( inputs )
                 self.metric.update(outputs, targets)
+                
+                if i % 39 == 0:
+                    cur = self.metric.get_results()
+
+                    acc = cur['Acc']
+                    loss = cur['Loss']
+
+                    # 若 Acc 是 tuple，则取 top1
+                    if isinstance(acc, (tuple, list)):
+                        acc = acc[0]
+
+                    # Loss 也可能是 tuple
+                    if isinstance(loss, (tuple, list)):
+                        loss = loss[0]
+
+                    print(f"[Eval batch {i}] Acc={acc:.4f}, Loss={loss:.4f}")
+
+
         return self.metric.get_results()
     
     def __call__(self, *args, **kwargs):
