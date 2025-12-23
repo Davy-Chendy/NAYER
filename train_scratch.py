@@ -77,7 +77,7 @@ parser.add_argument('--wd', '--weight-decay', default=5e-4, type=float,
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=0, type=int,
                     metavar='N', help='print frequency (default: 0)')
-parser.add_argument('--seed', default=None, type=int,
+parser.add_argument('--seed', default=0, type=int,
                     help='seed for initializing training.')
 
 best_acc1 = 0
@@ -110,6 +110,19 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
+def replace_bn_with_gn(model, num_groups=32):
+    for name, module in model.named_children():
+        # 递归处理子模块
+        replace_bn_with_gn(module, num_groups)
+
+        if isinstance(module, nn.BatchNorm2d):
+            gn = nn.GroupNorm(
+                num_groups=num_groups,
+                num_channels=module.num_features,
+                affine=True
+            )
+            setattr(model, name, gn)
+            
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
@@ -140,7 +153,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # Logger
     ############################################
     log_name = 'R%d-%s-%s'%(args.rank, args.dataset, args.model) if args.multiprocessing_distributed else '%s-%s'%(args.dataset, args.model)
-    args.logger = datafree.utils.logger.get_logger(log_name, output='checkpoints/scratch/log-%s-%s.txt'%(args.dataset, args.model))
+    args.logger = datafree.utils.logger.get_logger(log_name, output='checkpoints/scratch/%s/logs/log-%s-%s.txt'%(args.dataset, args.dataset, args.model))
     if args.rank<=0:
         for k, v in datafree.utils.flatten_dict( vars(args) ).items(): # print args
             args.logger.info( "%s: %s"%(k,v) )
@@ -168,7 +181,14 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################
     # Setup models and datasets
     ############################################
-    model = registry.get_model(args.model, num_classes=num_classes, pretrained=args.pretrained)
+    model = registry.get_model(args.model, num_classes=num_classes, pretrained=False)
+    
+    model.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.model),
+                                           map_location='cpu')['state_dict'])
+    
+    replace_bn_with_gn(model, num_groups=32)
+
+    model = model.train()  
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
@@ -200,6 +220,26 @@ def main_worker(gpu, ngpus_per_node, args):
     # Setup optimizer
     ############################################
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    
+    # # 先冻结所有参数
+    # for p in model.parameters():
+    #     p.requires_grad = False
+
+    # # 只解冻 GroupNorm 参数
+    # for m in model.modules():
+    #     if isinstance(m, nn.GroupNorm):
+    #         for p in m.parameters():
+    #             p.requires_grad = True
+                
+    # trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    # optimizer = torch.optim.SGD(
+    #     trainable_params,
+    #     args.lr,
+    #     momentum=args.momentum,
+    #     weight_decay=args.weight_decay
+    # )
+        
+
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     if args.sche == "cos":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
@@ -265,30 +305,47 @@ def main_worker(gpu, ngpus_per_node, args):
         scheduler.step()
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
-        _best_ckpt = 'checkpoints/scratch/%s_%s_%s.pth'%(args.dataset, args.model, args.ver)
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            if 66.4 < acc1 < 66.5:
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'arch': args.model,
-                    'state_dict': model.state_dict(),
-                    'best_acc1': float(acc1),
-                    'optimizer' : optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict()
-                }, True, _best_ckpt)
-                best_acc1 = acc1
-            if acc1 == 66.44:
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'arch': args.model,
-                    'state_dict': model.state_dict(),
-                    'best_acc1': float(acc1),
-                    'optimizer' : optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict()
-                }, True, _best_ckpt)
-                args.logger.info("Best: %.4f" % acc1)
-                return 1
+        save_dict = {
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_acc1': float(best_acc1),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+        }
+
+        # 同时保留一个 latest，方便直接 resume
+        latest_path = f'checkpoints/scratch/{args.dataset}/checkpoints/{args.dataset}-{args.model}_latest.pth'
+        torch.save(save_dict, latest_path)
+
+        # best 单独保存一份
+        if is_best:
+            best_path = f'checkpoints/scratch/{args.dataset}/checkpoints/{args.dataset}-{args.model}_best.pth'
+            torch.save(save_dict, best_path)
+            best_acc1 = acc1
+        # _best_ckpt = 'checkpoints/scratch/%s_%s_%s.pth'%(args.dataset, args.model, args.ver)
+        # if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+        #         and args.rank % ngpus_per_node == 0):
+        #     if 66.4 < acc1 < 66.5:
+        #         save_checkpoint({
+        #             'epoch': epoch + 1,
+        #             'arch': args.model,
+        #             'state_dict': model.state_dict(),
+        #             'best_acc1': float(acc1),
+        #             'optimizer' : optimizer.state_dict(),
+        #             'scheduler': scheduler.state_dict()
+        #         }, True, _best_ckpt)
+        #         best_acc1 = acc1
+        #     if acc1 == 66.44:
+        #         save_checkpoint({
+        #             'epoch': epoch + 1,
+        #             'arch': args.model,
+        #             'state_dict': model.state_dict(),
+        #             'best_acc1': float(acc1),
+        #             'optimizer' : optimizer.state_dict(),
+        #             'scheduler': scheduler.state_dict()
+        #         }, True, _best_ckpt)
+        #         args.logger.info("Best: %.4f" % acc1)
+        #         return 1
 
     if args.rank<=0:
         args.logger.info("Best: %.4f"%best_acc1)

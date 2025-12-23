@@ -28,12 +28,12 @@ import wandb
 import timm
 import sys
 import os
-os.environ['TORCH_HOME'] = '/chenyaofo/cgh/cowork/cdy/research/checkpoints'
+# os.environ['TORCH_HOME'] = '/chenyaofo/cgh/cowork/cdy/research/checkpoints'
 
-sys.path.append('/chenyaofo/cgh/cowork/cdy/research/SAR_cdy/models')
+# sys.path.append('/chenyaofo/cgh/cowork/cdy/research/SAR_cdy/models')
 
-# 然后直接导入 Res 模块
-import Res as Resnet
+# # 然后直接导入 Res 模块
+# import Res as Resnet
 
 parser = argparse.ArgumentParser(description='Data-free Knowledge Distillation')
 
@@ -179,6 +179,41 @@ def main():
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
+def replace_bn_with_gn(model, num_groups=32):
+    for name, module in model.named_children():
+        # 递归处理子模块
+        replace_bn_with_gn(module, num_groups)
+
+        if isinstance(module, nn.BatchNorm2d):
+            gn = nn.GroupNorm(
+                num_groups=num_groups,
+                num_channels=module.num_features,
+                affine=True
+            )
+            setattr(model, name, gn)
+            
+def print_model_structure(model, name="", indent=0):
+    """
+    Recursively print the model structure, highlighting GroupNorm layers.
+    
+    Args:
+        model (nn.Module): The model to inspect.
+        name (str): Name of the current module (for recursion).
+        indent (int): Indentation level for pretty printing.
+    """
+    spacer = "  " * indent
+    for child_name, child in model.named_children():
+        full_name = f"{name}.{child_name}" if name else child_name
+        
+        # Check if it's a GroupNorm layer
+        if isinstance(child, torch.nn.GroupNorm):
+            print(f"{spacer}├─ {child_name}: {child}  🟢 [GroupNorm]")
+        elif isinstance(child, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+            print(f"{spacer}├─ {child_name}: {child}  🔴 [BatchNorm - SHOULD NOT EXIST!]")
+        else:
+            print(f"{spacer}├─ {child_name}: {child.__class__.__name__}")
+            # Recurse into children
+            print_model_structure(child, full_name, indent + 1)
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
@@ -221,7 +256,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         log_name = '%s-%s-%s-%s' % (args.dataset, args.teacher, args.student, timestamp)
 
-    log_file = 'checkpoints/datafree-%s/%s/log-%s-%s-%s%s-%s.txt' % (
+    log_file = 'checkpoints/datafree-%s/%s/logs/log-%s-%s-%s%s-%s.txt' % (
         args.method, args.dataset, args.dataset, args.teacher, args.student, args.log_tag, timestamp
     )
 
@@ -284,7 +319,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.DataParallel(model).cuda()
             return model
 
-    student = registry.get_model(args.student, num_classes=num_classes)
+    # student = registry.get_model(args.student, num_classes=num_classes)
     teacher = registry.get_model(args.teacher, num_classes=num_classes, pretrained=True).eval()
     args.normalizer = datafree.utils.Normalizer(**registry.NORMALIZE_DICT[args.dataset])
     pretrain = torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
@@ -292,8 +327,28 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.dataset != 'imagenet':
         teacher.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
                                            map_location='cpu')['state_dict'])
+
+    student = registry.get_model(
+        args.teacher,
+        num_classes=num_classes,
+        pretrained=False
+    )
+
+    # 2. 如有 BN 预训练权重，先 load
+    if args.dataset != 'imagenet':
+        student.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
+                                           map_location='cpu')['state_dict'])
+    # 3. BN → GN
+    replace_bn_with_gn(student, num_groups=32)
+
+    student = student.train()        
+        
     student = prepare_model(student)
     teacher = prepare_model(teacher)
+    
+    # print("=== Model Structure (GN highlighted) ===")
+    # print_model_structure(student)
+    # sys.exit()
     # student = timm.create_model('resnet50_gn', pretrained=True).cuda(args.gpu)
     # student = Resnet.__dict__['resnet50'](pretrained=False).eval().cuda(args.gpu)
     # teacher = Resnet.__dict__['resnet50'](pretrained=True).eval().cuda(args.gpu)
@@ -369,8 +424,26 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################
     # Setup optimizer
     ############################################
-    optimizer = torch.optim.SGD(student.parameters(), args.lr, weight_decay=args.weight_decay,
-                                momentum=0.9)
+    
+    # 先冻结所有参数
+    for p in student.parameters():
+        p.requires_grad = False
+
+    # 只解冻 GroupNorm 参数
+    for m in student.modules():
+        if isinstance(m, nn.GroupNorm):
+            for p in m.parameters():
+                p.requires_grad = True
+                
+    trainable_params = filter(lambda p: p.requires_grad, student.parameters())
+    optimizer = torch.optim.SGD(
+        trainable_params,
+        args.lr,
+        momentum=0.9,
+        weight_decay=args.weight_decay
+    )
+    # optimizer = torch.optim.SGD(student.parameters(), args.lr, weight_decay=args.weight_decay,
+    #                             momentum=0.9)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, int((args.epochs - args.warmup)), eta_min=args.eta_min)
 
     args.current_epoch = 0
@@ -403,10 +476,10 @@ def main_worker(gpu, ngpus_per_node, args):
     # Evaluate
     ############################################
     if args.evaluate_only:
-        # student.eval()
-        # eval_results = evaluator(student, device=args.gpu)
-        teacher.eval()
-        eval_results = evaluator(teacher, device=args.gpu)
+        student.eval()
+        eval_results = evaluator(student, device=args.gpu)
+        # teacher.eval()
+        # eval_results = evaluator(teacher, device=args.gpu)
         print('[Eval] Acc={acc:.4f}'.format(acc=eval_results['Acc'][0]))
         return
 
@@ -477,12 +550,12 @@ def main_worker(gpu, ngpus_per_node, args):
         }
 
         # 同时保留一个 latest，方便直接 resume
-        latest_path = f'checkpoints/datafree-{args.method}/{args.dataset}/{args.dataset}-{args.teacher}2{args.student}{args.log_tag}_latest.pth'
+        latest_path = f'checkpoints/datafree-{args.method}/{args.dataset}/checkpoints/{args.dataset}-{args.teacher}2{args.student}{args.log_tag}_latest.pth'
         torch.save(save_dict, latest_path)
 
         # best 单独保存一份
         if is_best:
-            best_path = f'checkpoints/datafree-{args.method}/{args.dataset}/{args.dataset}-{args.teacher}2{args.student}{args.log_tag}_best.pth'
+            best_path = f'checkpoints/datafree-{args.method}/{args.dataset}/checkpoints/{args.dataset}-{args.teacher}2{args.student}{args.log_tag}_best.pth'
             torch.save(save_dict, best_path)
             best_acc1 = acc1
 
