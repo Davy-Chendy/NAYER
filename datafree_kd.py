@@ -38,10 +38,11 @@ import os
 parser = argparse.ArgumentParser(description='Data-free Knowledge Distillation')
 
 # Data Free
-parser.add_argument('--method', default='nldf', choices=['nldf', 'nayer'])
+parser.add_argument('--method', default='nldf', choices=['nldf', 'nayer', 'cpnet'])
 parser.add_argument('--adv', default=1.33, type=float, help='scaling factor for adversarial distillation')
 parser.add_argument('--bn', default=10, type=float, help='scaling factor for BN regularization')
 parser.add_argument('--oh', default=0.5, type=float, help='scaling factor for one hot loss (cross entropy)')
+parser.add_argument('--dist', default=0.15, type=float, help='scaling factor for distance loss')
 parser.add_argument('--act', default=0, type=float, help='scaling factor for activation loss used in DAFL')
 parser.add_argument('--balance', default=0, type=float, help='scaling factor for class balance')
 parser.add_argument('--save_dir', default='/chenyaofo/cgh/cowork/cdy/research/NAYER/outputs', type=str)
@@ -137,6 +138,11 @@ parser.add_argument('-p', '--print_freq', default=40, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
+parser.add_argument('--training_params', default='all', choices=['all', 'norm'])
+parser.add_argument('--bn_pretrained', action='store_true',
+                    help='student load bn pre-trained weights and bias')
+parser.add_argument('--gn_replaced', action='store_true',
+                    help='determine whether replace bn with gn')
 
 best_acc1 = 0
 time_cost = 0
@@ -216,6 +222,11 @@ def print_model_structure(model, name="", indent=0):
             print_model_structure(child, full_name, indent + 1)
 
 def main_worker(gpu, ngpus_per_node, args):
+    if args.bn_pretrained:
+        bn_load = ''
+    else:
+        bn_load = 'Not'
+    args.log_tag = f'{args.epochs}ep_{args.warmup}wp_{args.g_steps}gsteps_{args.g_life}glife_{args.g_loops}gloop_{args.gwp_loops}gwploop_{args.lr}lr_{args.kd_steps}kdsteps_{args.batch_size}bs_{args.synthesis_batch_size}sbs_{bn_load}LoadBN_Training{args.training_params}'
     global best_acc1
     global time_cost
     args.gpu = gpu
@@ -269,6 +280,7 @@ def main_worker(gpu, ngpus_per_node, args):
     name_project = 'datafree-%s/log-%s-%s-%s%s.txt' % (
     args.method, args.dataset, args.teacher, args.student, args.log_tag)
     wandb.init(project="FastDFKD",
+               mode='offline',
                name=name_project,
                tags="t1",
                config=args.__dict__)
@@ -335,11 +347,13 @@ def main_worker(gpu, ngpus_per_node, args):
     )
 
     # 2. 如有 BN 预训练权重，先 load
-    if args.dataset != 'imagenet':
+    print(f'bn weights and bias are loaded: {args.bn_pretrained}')
+    if args.bn_pretrained:
         student.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.teacher),
                                            map_location='cpu')['state_dict'])
     # 3. BN → GN
-    replace_bn_with_gn(student, num_groups=32)
+    if args.gn_replaced:
+        replace_bn_with_gn(student, num_groups=32)
 
     student = student.train()        
         
@@ -369,12 +383,12 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################
     if args.synthesis_batch_size is None:
         args.synthesis_batch_size = args.batch_size
-
+        
+    le_name = "label_embedding/" + args.dataset + "_le.pickle"
+    with open(le_name, "rb") as label_file:
+        label_emb = pickle.load(label_file)
+        label_emb = label_emb.to(args.gpu).float()
     if args.method == 'nayer':
-        le_name = "label_embedding/" + args.dataset + "_le.pickle"
-        with open(le_name, "rb") as label_file:
-            label_emb = pickle.load(label_file)
-            label_emb = label_emb.to(args.gpu).float()
 
         if args.dataset == 'cifar10' or args.dataset == 'cifar100':
             generator = datafree.models.generator.NLGenerator(ngf=64, img_size=32, nc=3, nl=num_classes,
@@ -418,6 +432,29 @@ def main_worker(gpu, ngpus_per_node, args):
                                                   g_steps=args.g_steps, warmup=args.warmup, lr_g=args.lr_g, adv=args.adv,
                                                   bn=args.bn, oh=args.oh, bn_mmt=args.bn_mmt, dataset=args.dataset,
                                                   g_life=args.g_life, g_loops=args.g_loops, gwp_loops=args.gwp_loops)
+    elif args.method == 'cpnet':
+        from datafree.models.generator import get_cfg
+        if args.dataset == 'tiny_imagenet':
+            img_size = (3, 64, 64)
+        elif args.dataset == 'imagenet':
+            img_size = (3, 224, 224)
+        else:
+            img_size = (3, 32, 32)
+        cfg_list, init_size, bn_nodes = get_cfg(teacher, img_size=img_size, net_name=args.teacher)
+        generator = datafree.models.generator.CoupledGenerator(cfg_list, init_size=init_size, n_classes=num_classes, 
+                                                        le_emb_size=args.le_emb_size, label_emb=label_emb,
+                                                        sbz=args.synthesis_batch_size)
+        generator = prepare_model(generator)
+        synthesizer = datafree.synthesis.CoupledSynthesizer(teacher, student, generator,
+                                                num_classes=num_classes, img_size=img_size, bn_nodes=bn_nodes,
+                                                save_dir=args.save_dir, device=args.gpu, transform=ori_dataset.transform,
+                                                normalizer=args.normalizer,
+                                                synthesis_batch_size=args.synthesis_batch_size,
+                                                sample_batch_size=args.batch_size,
+                                                g_steps=args.g_steps, warmup=args.warmup, lr_g=args.lr_g, adv=args.adv,
+                                                bn=args.bn, oh=args.oh, dist=args.dist, bn_mmt=args.bn_mmt, dataset=args.dataset,
+                                                g_life=args.g_life, g_loops=args.g_loops, gwp_loops=args.gwp_loops)
+    
     else:
         raise NotImplementedError
 
@@ -425,25 +462,29 @@ def main_worker(gpu, ngpus_per_node, args):
     # Setup optimizer
     ############################################
     
-    # 先冻结所有参数
-    for p in student.parameters():
-        p.requires_grad = False
+    if args.training_params == 'norm':
+        print('Training Only Norm Parameters')
+        # 先冻结所有参数
+        for p in student.parameters():
+            p.requires_grad = False
 
-    # 只解冻 GroupNorm 参数
-    for m in student.modules():
-        if isinstance(m, nn.GroupNorm):
-            for p in m.parameters():
-                p.requires_grad = True
-                
-    trainable_params = filter(lambda p: p.requires_grad, student.parameters())
-    optimizer = torch.optim.SGD(
-        trainable_params,
-        args.lr,
-        momentum=0.9,
-        weight_decay=args.weight_decay
-    )
-    # optimizer = torch.optim.SGD(student.parameters(), args.lr, weight_decay=args.weight_decay,
-    #                             momentum=0.9)
+        # 只解冻 GroupNorm 参数
+        for m in student.modules():
+            if isinstance(m, nn.GroupNorm):
+                for p in m.parameters():
+                    p.requires_grad = True
+                    
+        trainable_params = filter(lambda p: p.requires_grad, student.parameters())
+        optimizer = torch.optim.SGD(
+            trainable_params,
+            args.lr,
+            momentum=0.9,
+            weight_decay=args.weight_decay
+        )
+    elif args.training_params == 'all':
+        print('Training All Parameters')
+        optimizer = torch.optim.SGD(student.parameters(), args.lr, weight_decay=args.weight_decay,
+                                    momentum=0.9)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, int((args.epochs - args.warmup)), eta_min=args.eta_min)
 
     args.current_epoch = 0

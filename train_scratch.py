@@ -16,6 +16,17 @@ import torch.utils.data.distributed
 
 import registry
 import datafree
+import sys
+import numpy as np
+import timm
+
+os.environ['TORCH_HOME'] = '/home/troynsc/cgh/cdy/research/checkpoints'
+
+sys.path.append('/home/troynsc/cgh/cdy/research/SAR_cdy/models')
+
+# 然后直接导入 Res 模块
+import Res as Resnet
+from norm_library import *
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 # Basic Settings
@@ -181,12 +192,26 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################
     # Setup models and datasets
     ############################################
-    model = registry.get_model(args.model, num_classes=num_classes, pretrained=False)
+    if args.dataset != 'imagenet':
+        model = registry.get_model(args.model, num_classes=num_classes, pretrained=False)
+        
+        model.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.model),
+                                            map_location='cpu')['state_dict'])
     
-    model.load_state_dict(torch.load('checkpoints/pretrained/%s_%s.pth' % (args.dataset, args.model),
-                                           map_location='cpu')['state_dict'])
+    else:
+        model = Resnet.__dict__['resnet50'](pretrained=False).eval().cuda(args.gpu)
+        
+        # model = timm.create_model('resnet50', pretrained=True).eval()
+        model.cuda(args.gpu)
+        
+    replace_bn_with_gn(model)
+    # for name, module in model.named_modules():
+    #     print(f"{name}: {module}")
+    # state_dict = torch.load('/home/troynsc/cgh/cdy/research/NAYER/LN_model.pth')  # 或 'cuda' 如果用 GPU
+    # model.load_state_dict(state_dict)
+    # torch.save(model.state_dict(), 'GN_model.pth')
     
-    replace_bn_with_gn(model, num_groups=32)
+    # check_all_norm_layers_are_gn(model, verbose=True)
 
     model = model.train()  
     if not torch.cuda.is_available():
@@ -221,26 +246,26 @@ def main_worker(gpu, ngpus_per_node, args):
     ############################################
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     
-    # # 先冻结所有参数
-    # for p in model.parameters():
-    #     p.requires_grad = False
+    # 先冻结所有参数
+    for p in model.parameters():
+        p.requires_grad = False
 
-    # # 只解冻 GroupNorm 参数
-    # for m in model.modules():
-    #     if isinstance(m, nn.GroupNorm):
-    #         for p in m.parameters():
-    #             p.requires_grad = True
+    # 只解冻 GroupNorm 参数
+    for m in model.modules():
+        if isinstance(m, nn.GroupNorm):
+            for p in m.parameters():
+                p.requires_grad = True
                 
-    # trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    # optimizer = torch.optim.SGD(
-    #     trainable_params,
-    #     args.lr,
-    #     momentum=args.momentum,
-    #     weight_decay=args.weight_decay
-    # )
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.SGD(
+        trainable_params,
+        args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay
+    )
         
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    # optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     if args.sche == "cos":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
     else:
@@ -295,6 +320,28 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         args.current_epoch=epoch
+        
+        if epoch == 0:
+            args.logger.info("==> Switching to full fine-tuning")
+            # Unfreeze all parameters
+            for p in model.parameters():
+                p.requires_grad = True
+
+            # Re-create optimizer with all parameters
+            optimizer = torch.optim.SGD(
+                model.parameters(),
+                args.lr,
+                momentum=args.momentum,
+                weight_decay=args.weight_decay
+            )
+            # Re-create scheduler if needed (optional but safe)
+            if args.sche == "cos":
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs - epoch, eta_min=0)
+            else:
+                # Adjust milestones if needed (optional)
+                remaining_milestones = [m - epoch for m in milestones if m > epoch]
+                scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=remaining_milestones, gamma=0.2)
+                
         train(train_loader, model, criterion, optimizer, args)
         model.eval()
         eval_results = evaluator(model, device=args.gpu)
@@ -305,23 +352,26 @@ def main_worker(gpu, ngpus_per_node, args):
         scheduler.step()
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
-        save_dict = {
-            'epoch': epoch + 1,
-            'state_dict': model.state_dict(),
-            'best_acc1': float(best_acc1),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-        }
+        # save_dict = {
+        #     'epoch': epoch + 1,
+        #     'state_dict': model.state_dict(),
+        #     'best_acc1': float(best_acc1),
+        #     'optimizer': optimizer.state_dict(),
+        #     'scheduler': scheduler.state_dict(),
+        # }
 
-        # 同时保留一个 latest，方便直接 resume
-        latest_path = f'checkpoints/scratch/{args.dataset}/checkpoints/{args.dataset}-{args.model}_latest.pth'
-        torch.save(save_dict, latest_path)
-
-        # best 单独保存一份
+        # # 同时保留一个 latest，方便直接 resume
+        # latest_path = f'checkpoints/scratch/{args.dataset}/checkpoints/{args.dataset}-{args.model}_latest.pth'
+        # torch.save(save_dict, latest_path)
+        
         if is_best:
-            best_path = f'checkpoints/scratch/{args.dataset}/checkpoints/{args.dataset}-{args.model}_best.pth'
-            torch.save(save_dict, best_path)
-            best_acc1 = acc1
+            torch.save(model.state_dict(), 'GN_training_all_model_lr0.0001.pth')
+
+        # # best 单独保存一份
+        # if is_best:
+        #     best_path = f'checkpoints/scratch/{args.dataset}/checkpoints/{args.dataset}-{args.model}_best.pth'
+        #     torch.save(save_dict, best_path)
+        #     best_acc1 = acc1
         # _best_ckpt = 'checkpoints/scratch/%s_%s_%s.pth'%(args.dataset, args.model, args.ver)
         # if not args.multiprocessing_distributed or (args.multiprocessing_distributed
         #         and args.rank % ngpus_per_node == 0):

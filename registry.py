@@ -166,8 +166,8 @@ def get_dataset(name: str, data_root: str='data', return_transform=False, split=
             T.ToTensor(),
             T.Normalize(**NORMALIZE_DICT[name]),
         ])
-        # data_root = os.path.join(data_root, 'ImageNet')
-        data_root = os.path.join(data_root, 'imagenet')
+        data_root = os.path.join(data_root, 'ImageNet')
+        # data_root = os.path.join(data_root, 'imagenet')
         train_root = os.path.join(data_root, 'train')
         val_root = os.path.join(data_root, 'val')
         # train_dst = None

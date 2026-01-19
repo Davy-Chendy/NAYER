@@ -120,3 +120,4 @@ config/local_settings.py
 
 outputs/*
 wandb
+*.png
